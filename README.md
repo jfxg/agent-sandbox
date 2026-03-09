@@ -4,7 +4,16 @@ Run Claude Code in an isolated Docker container with full permissions but no acc
 
 ## Installation
 
-Clone this repo, then copy the scripts to `~/bin` and the Docker files to `~/.agent-sandbox/docker/`:
+```bash
+curl -fsSL https://raw.githubusercontent.com/jfxg/agent-sandbox/main/install.sh | bash
+```
+
+This downloads the scripts to `~/bin/`, the Docker files to `~/.agent-sandbox/docker/`, and builds the image.
+
+**Dependencies:** Docker, `jq` (`brew install jq`), and a working [Claude Code](https://claude.ai/code) login on your host.
+
+<details>
+<summary>Manual install</summary>
 
 ```bash
 git clone https://github.com/jfxg/agent-sandbox.git
@@ -12,15 +21,10 @@ cd agent-sandbox
 cp bin/agent bin/agent-build ~/bin/
 chmod +x ~/bin/agent ~/bin/agent-build
 cp -r docker/ ~/.agent-sandbox/docker/
-```
-
-Make sure `~/bin` is in your PATH, then build the image:
-
-```bash
 agent-build
 ```
 
-**Dependencies:** Docker, `jq` (`brew install jq`), and a working [Claude Code](https://claude.ai/code) login on your host.
+</details>
 
 ## Usage
 
@@ -79,13 +83,15 @@ agent-build            # normal build
 agent-build --no-cache # force full layer rebuild
 ```
 
+> **macOS + Docker Desktop:** Docker Desktop's containerd image store resets frequently — typically after sleep or the screen locking — which removes the sandbox image. `agent` detects this and rebuilds automatically before starting your session.
+
 ## Session storage
 
 Sessions persist at `~/.agent-sandbox/sessions/<id>/` after the container exits.
 
 ```
 ~/.agent-sandbox/
-  docker/           ← Dockerfile + entrypoint (installed manually; see Installation)
+  docker/           ← Dockerfile + entrypoint
   sessions/
     20240315-143022-myproject-auth-refactor/
       session.json  ← session metadata
