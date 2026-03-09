@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# agent: Spin up an isolated Docker sandbox and run Claude Code with full permissions.
+# The container is ephemeral -- it is destroyed on exit. The workspace directory
+# is preserved at ~/.agent-sandbox/<session-id>/workspace so you can pull out
+# any artifacts afterward.
+#
+# By default uses your existing Claude Code login (~/.claude mounted into the container).
+# Pass --ollama to route inference to a local Ollama instance instead.
+#
+# Usage:
+#   agent [options] [-- <prompt>]
+#   agent ls
+#
+# Options:
+#   --name <label>  Optional short label for the session (e.g. "infra"). Combined with
+#                   the date and project to form the full session ID shown on startup.
+#   --resume <id>   Resume an existing session by its full session ID.
+#   --ollama [url]  Use Ollama backend. URL defaults to $OLLAMA_BASE_URL if omitted.
+#   --repo <slug>   Clone a GitHub repo (e.g. "owner/repo") into a fresh /workspace.
+#                   Or pass a local path to mount an existing directory instead.
+#   --branch <ref>  Branch, tag, or SHA to check out after cloning (used with --repo slug).
+#   --shell         Drop into a zsh shell instead of launching Claude
+#   --no-auth       Skip copying host credentials into the container (useful for
+#                   testing a fresh login to see where Claude stores auth on Linux)
+#   -h, --help      Show this help message
+#
+# Subcommands:
+#   ls              List all sessions, newest first.
+#   rm <id>         Remove a session and its workspace by session ID.
+#   clean [--days N] Remove unnamed sessions older than N days (default: 7).
+#                   Shows what will be deleted and asks for confirmation.
+#
+# To build or rebuild the image, run: agent-build
+#
+# Environment:
+#   OLLAMA_BASE_URL    Default Ollama URL used when --ollama is passed without a URL.
+#   DOCKER_CONTEXT     Docker context to use (e.g. "desktop-linux"). Respected natively
+#                      by the docker CLI. Set in ~/.zshrc.local if your image and daemon
+#                      live in a non-default context (common with Docker Desktop on Mac).
+set -euo pipefail
+
+IMAGE_NAME="agent-sandbox"
+AGENT_SANDBOX_BASE="$HOME/.agent-sandbox"
+SESSIONS_BASE="$AGENT_SANDBOX_BASE/sessions"
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+blue()   { printf '\033[0;34m%s\033[0m\n' "$*"; }
+red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
+dim()    { printf '\033[2m%s\033[0m\n'    "$*"; }
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+MOUNT_REPO=""
+CLONE_REPO=""
+CLONE_BRANCH=""
+SESSION_NAME=""
+RESUME_ID=""
+DROP_TO_SHELL=false
+SKIP_AUTH=false
+BACKEND="anthropic"
+OLLAMA_URL=""
+PROMPT_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        ls)
+            if [[ ! -d "$SESSIONS_BASE" ]] || \
+               [[ -z "$(find "$SESSIONS_BASE" -maxdepth 2 -name 'session.json' 2>/dev/null | head -1)" ]]; then
+                echo "No sessions yet."
+                exit 0
+            fi
+            printf '\n%-50s  %s\n' "SESSION ID" "LAST MODIFIED"
+            printf '%-50s  %s\n' "--------------------------------------------------" "--------------------"
+            while IFS= read -r f; do
+                id="$(basename "$(dirname "$f")")"
+                modified="$(date -r "$f" '+%Y-%m-%d %H:%M')"
+                printf '%-50s  %s\n' "$id" "$modified"
+            done < <(find "$SESSIONS_BASE" -maxdepth 2 -mindepth 2 -name 'session.json' \
+                         -exec ls -t1 {} + 2>/dev/null)
+            echo ""
+            exit 0
+            ;;
+        rm)
+            [[ -z "${2:-}" ]] && { red "error: rm requires a session ID"; exit 1; }
+            RM_DIR="$SESSIONS_BASE/$2"
+            SESSION_FILE="$RM_DIR/session.json"
+            if [[ ! -f "$SESSION_FILE" ]]; then
+                red "error: session not found: $2"
+                exit 1
+            fi
+            _ws="$(jq -r '.workspace // "unknown"' "$SESSION_FILE")"
+            _managed="$(jq -r '.managed // true' "$SESSION_FILE")"
+            echo "Session  : $2"
+            echo "Workspace: $_ws"
+            printf 'Remove? [y/N] '
+            read -r reply
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                rm -rf "$RM_DIR"
+                green "Removed session $2"
+                if [[ "$_managed" == "false" ]]; then
+                    dim "  (external workspace preserved: $_ws)"
+                fi
+            else
+                dim "Cancelled."
+            fi
+            exit 0
+            ;;
+        clean)
+            shift
+            CLEAN_DAYS=7
+            [[ -n "${1:-}" && "$1" == "--days" ]] && { CLEAN_DAYS="$2"; shift 2; }
+            if [[ ! -d "$SESSIONS_BASE" ]]; then
+                echo "No sessions yet."
+                exit 0
+            fi
+            # Collect unnamed session dirs (name portion is "unnamed") older than CLEAN_DAYS.
+            # Note: find -mtime +N matches files older than N full 24-hour periods, so
+            # we skip the -mtime filter entirely when CLEAN_DAYS=0 to match everything.
+            STALE=()
+            FIND_ARGS=("$SESSIONS_BASE" -mindepth 1 -maxdepth 1 -type d -name '*-unnamed')
+            [[ "$CLEAN_DAYS" -gt 0 ]] && FIND_ARGS+=(-mtime +"$CLEAN_DAYS")
+            while IFS= read -r d; do
+                [[ -f "$d/session.json" ]] || continue
+                STALE+=("$d")
+            done < <(find "${FIND_ARGS[@]}" 2>/dev/null | sort)
+            if [[ ${#STALE[@]} -eq 0 ]]; then
+                green "No unnamed sessions older than ${CLEAN_DAYS} days."
+                exit 0
+            fi
+            echo ""
+            yellow "Unnamed sessions older than ${CLEAN_DAYS} days:"
+            for d in "${STALE[@]}"; do
+                id="$(basename "$d")"
+                modified="$(date -r "$d/session.json" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$d" '+%Y-%m-%d %H:%M')"
+                printf '  %-50s  (%s)\n' "$id" "$modified"
+            done
+            echo ""
+            printf 'Delete %d session(s)? [y/N] ' "${#STALE[@]}"
+            read -r reply
+            if [[ "$reply" =~ ^[Yy]$ ]]; then
+                for d in "${STALE[@]}"; do
+                    rm -rf "$d"
+                done
+                green "Removed ${#STALE[@]} session(s)."
+            else
+                dim "Cancelled."
+            fi
+            exit 0
+            ;;
+        --name)
+            [[ -z "${2:-}" ]] && { red "error: --name requires a value"; exit 1; }
+            SESSION_NAME="$2"
+            shift 2
+            ;;
+        --resume)
+            [[ -z "${2:-}" ]] && { red "error: --resume requires a session ID"; exit 1; }
+            RESUME_ID="$2"
+            shift 2
+            ;;
+        --ollama)
+            BACKEND="ollama"
+            # Optional URL argument — consume next arg only if it looks like a URL
+            if [[ -n "${2:-}" && "${2:-}" == http* ]]; then
+                OLLAMA_URL="$2"
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --repo)
+            [[ -z "${2:-}" ]] && { red "error: --repo requires a path or owner/repo slug"; exit 1; }
+            # Local path: starts with / ~ . or exists on disk → mount it
+            # GitHub slug: owner/repo → clone fresh inside the container
+            if [[ "$2" == /* || "$2" == ~* || "$2" == ./* || -d "$2" ]]; then
+                MOUNT_REPO="$(cd "$2" && pwd)"
+            else
+                CLONE_REPO="$2"
+            fi
+            shift 2
+            ;;
+        --branch)
+            [[ -z "${2:-}" ]] && { red "error: --branch requires a value"; exit 1; }
+            CLONE_BRANCH="$2"
+            shift 2
+            ;;
+        --shell)
+            DROP_TO_SHELL=true
+            shift
+            ;;
+        --no-auth)
+            SKIP_AUTH=true
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        --)
+            shift
+            PROMPT_ARGS=("$@")
+            break
+            ;;
+        *)
+            PROMPT_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# ── Preflight checks ──────────────────────────────────────────────────────────
+if ! command -v docker &>/dev/null; then
+    red "error: docker is not installed or not in PATH"
+    exit 1
+fi
+
+if ! command -v jq &>/dev/null; then
+    red "error: jq is not installed — install with: brew install jq"
+    exit 1
+fi
+
+if [[ "$BACKEND" == "anthropic" ]] && [[ "$SKIP_AUTH" == false ]] && [[ ! -d "$HOME/.claude" ]]; then
+    red "error: ~/.claude not found — run 'claude' on your host machine first to log in"
+    exit 1
+fi
+
+if [[ "$BACKEND" == "ollama" ]]; then
+    # Resolve URL: flag arg > env var > error
+    OLLAMA_URL="${OLLAMA_URL:-${OLLAMA_BASE_URL:-}}"
+    if [[ -z "$OLLAMA_URL" ]]; then
+        red "error: --ollama requires a URL (or set OLLAMA_BASE_URL)"
+        red "  e.g. agent --ollama http://192.168.1.50:11434"
+        exit 1
+    fi
+fi
+
+if [[ -z "$(docker images -q "$IMAGE_NAME" 2>/dev/null)" ]]; then
+    yellow "==> Image '$IMAGE_NAME' not found (Docker Desktop may have reset). Building now..."
+    AGENT_BUILD="$(dirname "$0")/agent-build"
+    if [[ ! -x "$AGENT_BUILD" ]]; then
+        red "error: could not find agent-build at $AGENT_BUILD"
+        exit 1
+    fi
+    "$AGENT_BUILD"
+fi
+
+# ── Preflight: --branch only makes sense with a GitHub slug ───────────────────
+if [[ -n "$CLONE_BRANCH" && -z "$CLONE_REPO" ]]; then
+    red "error: --branch requires --repo <owner/repo>"
+    exit 1
+fi
+
+# ── Preflight: --resume is mutually exclusive with --name / --repo / --branch ─
+if [[ -n "$RESUME_ID" && ( -n "$SESSION_NAME" || -n "$CLONE_REPO" || -n "$MOUNT_REPO" || -n "$CLONE_BRANCH" ) ]]; then
+    red "error: --resume cannot be combined with --name, --repo, or --branch"
+    exit 1
+fi
+
+# ── Session management ────────────────────────────────────────────────────────
+mkdir -p "$SESSIONS_BASE"
+
+SESSION_ID=""
+WORKSPACE_HOST=""
+
+if [[ -n "$RESUME_ID" ]]; then
+    SESSION_FILE="$SESSIONS_BASE/$RESUME_ID/session.json"
+    if [[ ! -f "$SESSION_FILE" ]]; then
+        red "error: session not found: $RESUME_ID"
+        exit 1
+    fi
+    SESSION_ID="$RESUME_ID"
+    WORKSPACE_HOST="$(jq -r '.workspace' "$SESSION_FILE")"
+    CLONE_REPO="$(jq -r '.clone_repo // ""' "$SESSION_FILE")"
+    CLONE_BRANCH="$(jq -r '.clone_branch // ""' "$SESSION_FILE")"
+    dim "==> Resuming session: $SESSION_ID"
+else
+    # New session: derive project + name, generate ID
+    if [[ -n "$CLONE_REPO" ]]; then
+        _project="${CLONE_REPO##*/}"
+    elif [[ -n "$MOUNT_REPO" ]]; then
+        _project="$(basename "$MOUNT_REPO")"
+    else
+        _project="workspace"
+    fi
+    _label="${SESSION_NAME:-unnamed}"
+    SESSION_ID="$(date +%Y%m%d-%H%M%S)-${_project}-${_label}"
+    SESSION_DIR="$SESSIONS_BASE/$SESSION_ID"
+
+    if [[ -n "$MOUNT_REPO" ]]; then
+        WORKSPACE_HOST="$MOUNT_REPO"
+        _managed=false
+        dim "==> Mounting repo: $WORKSPACE_HOST"
+    else
+        WORKSPACE_HOST="$SESSION_DIR/workspace"
+        mkdir -p "$WORKSPACE_HOST"
+        _managed=true
+        if [[ -n "$CLONE_REPO" ]]; then
+            dim "==> Will clone $CLONE_REPO${CLONE_BRANCH:+@$CLONE_BRANCH} into: $WORKSPACE_HOST"
+        else
+            dim "==> Created workspace: $WORKSPACE_HOST"
+        fi
+    fi
+
+    # Save session file
+    mkdir -p "$SESSION_DIR"
+    jq -n \
+        --arg workspace "$WORKSPACE_HOST" \
+        --argjson managed "$_managed" \
+        --arg clone_repo "${CLONE_REPO:-}" \
+        --arg clone_branch "${CLONE_BRANCH:-}" \
+        '{workspace: $workspace, managed: $managed, clone_repo: $clone_repo, clone_branch: $clone_branch}' \
+        > "$SESSION_DIR/session.json"
+fi
+
+# ── Container command ─────────────────────────────────────────────────────────
+if $DROP_TO_SHELL; then
+    CONTAINER_CMD=(zsh)
+elif [[ ${#PROMPT_ARGS[@]} -gt 0 ]]; then
+    CONTAINER_CMD=(claude --dangerously-skip-permissions "${PROMPT_ARGS[@]}")
+else
+    CONTAINER_CMD=(claude --dangerously-skip-permissions)
+fi
+
+# Ollama: default to gpt-oss model unless the user already passed --model
+if [[ "$BACKEND" == "ollama" ]] && ! $DROP_TO_SHELL; then
+    if [[ ! " ${PROMPT_ARGS[*]:-} " =~ " --model " ]]; then
+        CONTAINER_CMD+=(--model gpt-oss)
+    fi
+fi
+
+# ── Docker flags ──────────────────────────────────────────────────────────────
+DOCKER_ARGS=(
+    --rm
+    --interactive
+    --tty
+    --name "agent-$(date +%s)"
+    --volume "$WORKSPACE_HOST":/workspace
+    --workdir /workspace
+    --env "COLORTERM=truecolor"
+)
+
+# ── GitHub clone config ───────────────────────────────────────────────────────
+[[ -n "$CLONE_REPO"   ]] && DOCKER_ARGS+=(--env "CLONE_REPO=$CLONE_REPO")
+[[ -n "$CLONE_BRANCH" ]] && DOCKER_ARGS+=(--env "CLONE_BRANCH=$CLONE_BRANCH")
+
+# ── Claude config mounts (both backends) ─────────────────────────────────────
+# Mount host Claude config so Claude Code doesn't start in first-run setup mode
+# (theme picker, etc.). Skipped only if --no-auth is set.
+if [[ "$SKIP_AUTH" == false ]]; then
+    DOCKER_ARGS+=(--volume "$HOME/.claude":/tmp/claude-host:ro)
+    [[ -f "$HOME/.claude.json" ]] && \
+        DOCKER_ARGS+=(--volume "$HOME/.claude.json":/tmp/claude-host.json:ro)
+    [[ -d "$HOME/.local/share/claude" ]] && \
+        DOCKER_ARGS+=(--volume "$HOME/.local/share/claude":/tmp/claude-local-share:ro)
+fi
+
+# ── Backend-specific config ───────────────────────────────────────────────────
+if [[ "$BACKEND" == "ollama" ]]; then
+    # Route inference to Ollama. ANTHROPIC_API_KEY is required by the SDK but
+    # unused — any non-empty value works.
+    # Note: we intentionally do NOT inject OAuth credentials here — having both
+    # an API key and a claude.ai session causes Claude Code to warn about auth conflict.
+    DOCKER_ARGS+=(
+        --env "ANTHROPIC_BASE_URL=$OLLAMA_URL"
+        --env "ANTHROPIC_API_KEY=ollama"
+    )
+elif [[ "$SKIP_AUTH" == false ]]; then
+    # Anthropic backend: extract OAuth token from macOS Keychain and pass to the
+    # container. The entrypoint writes it to ~/.claude/.credentials.json (the Linux
+    # auth location). On macOS the token lives in Keychain, not in any file on disk.
+    if command -v security &>/dev/null; then
+        _CLAUDE_CREDS="$(security find-generic-password \
+            -s "Claude Code-credentials" -a "$(whoami)" -w 2>/dev/null || true)"
+        if [[ -n "$_CLAUDE_CREDS" ]]; then
+            _CREDS_TMP="$(mktemp /tmp/claude-creds-XXXXXX)"
+            printf '%s' "$_CLAUDE_CREDS" > "$_CREDS_TMP"
+            DOCKER_ARGS+=(--volume "$_CREDS_TMP":/tmp/claude-credentials:ro)
+            trap "rm -f '$_CREDS_TMP'" EXIT
+        fi
+    fi
+fi
+
+# ── Common mounts (both backends) ─────────────────────────────────────────────
+
+# Mount git config read-only so the agent can commit with your identity
+[[ -f "$HOME/.gitconfig" ]] && \
+    DOCKER_ARGS+=(--volume "$HOME/.gitconfig":/home/agent/.gitconfig:ro)
+
+# Pass GitHub auth token so the agent can use gh/git inside the container.
+# On macOS gh stores the token in Keychain (not in ~/.config/gh), so we extract
+# it explicitly and pass it as GH_TOKEN, which both gh and git respect.
+if command -v gh &>/dev/null; then
+    _GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+    if [[ -n "$_GH_TOKEN" ]]; then
+        DOCKER_ARGS+=(--env "GH_TOKEN=$_GH_TOKEN")
+        # Configure gh as git's credential helper via env vars so we don't need
+        # to write to ~/.gitconfig (which is mounted read-only from the host).
+        DOCKER_ARGS+=(
+            --env "GIT_CONFIG_COUNT=1"
+            --env "GIT_CONFIG_KEY_0=credential.helper"
+            --env "GIT_CONFIG_VALUE_0=!gh auth git-credential"
+        )
+    fi
+fi
+
+# Mount zsh config — these override the defaults installed by oh-my-zsh in the image
+[[ -f "$HOME/.zshrc"    ]] && DOCKER_ARGS+=(--volume "$HOME/.zshrc":/home/agent/.zshrc:ro)
+[[ -f "$HOME/.zprofile" ]] && DOCKER_ARGS+=(--volume "$HOME/.zprofile":/home/agent/.zprofile:ro)
+
+# Mount any custom oh-my-zsh themes so your prompt looks right
+[[ -d "$HOME/.oh-my-zsh/custom/themes" ]] && \
+    DOCKER_ARGS+=(--volume "$HOME/.oh-my-zsh/custom/themes":/home/agent/.oh-my-zsh/custom/themes:ro)
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+echo ""
+blue "==> Starting agent sandbox..."
+if [[ "$BACKEND" == "ollama" ]]; then
+    dim "    backend   : ollama ($OLLAMA_URL)"
+else
+    dim "    backend   : anthropic"
+fi
+[[ -n "$CLONE_REPO" ]] && dim "    clone     : $CLONE_REPO${CLONE_BRANCH:+@$CLONE_BRANCH}"
+dim "    session   : $SESSION_ID"
+dim "    workspace : $WORKSPACE_HOST"
+dim "    image     : $IMAGE_NAME"
+dim "    command   : ${CONTAINER_CMD[*]}"
+echo ""
+
+docker run "${DOCKER_ARGS[@]}" "$IMAGE_NAME" "${CONTAINER_CMD[@]}"
+
+# ── Post-exit summary ─────────────────────────────────────────────────────────
+echo ""
+green "==> Session ended."
+dim "    To resume: agent --resume $SESSION_ID"
+echo ""

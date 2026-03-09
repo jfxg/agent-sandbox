@@ -1,0 +1,103 @@
+# agent-sandbox
+
+Run Claude Code in an isolated Docker container with full permissions but no access to your host filesystem beyond what's explicitly mounted.
+
+## Installation
+
+Clone this repo, then copy the scripts to `~/bin` and the Docker files to `~/.agent-sandbox/docker/`:
+
+```bash
+git clone https://github.com/jfxg/agent-sandbox.git
+cd agent-sandbox
+cp bin/agent bin/agent-build ~/bin/
+chmod +x ~/bin/agent ~/bin/agent-build
+cp -r docker/ ~/.agent-sandbox/docker/
+```
+
+Make sure `~/bin` is in your PATH, then build the image:
+
+```bash
+agent-build
+```
+
+**Dependencies:** Docker, `jq` (`brew install jq`), and a working [Claude Code](https://claude.ai/code) login on your host.
+
+## Usage
+
+The primary use is pointing the agent at a repo and giving it a task:
+
+```bash
+# Mount a local repo and give the agent a task
+agent --repo ~/code/myproject "refactor the auth module"
+
+# Clone a GitHub repo and start an interactive session
+agent --repo owner/repo
+
+# Clone a specific branch
+agent --repo owner/repo --branch feature/my-branch
+```
+
+Label sessions to make them easier to identify later:
+
+```bash
+agent --repo ~/code/myproject --name auth-refactor "refactor the auth module"
+```
+
+Resume a previous session to continue where you left off (workspace and conversation history intact):
+
+```bash
+agent ls                              # find the session ID
+agent --resume 20240315-143022-myproject-auth-refactor
+```
+
+Drop into a shell inside the same container environment instead of launching Claude directly — useful for debugging, or run `claude` manually from within the shell:
+
+```bash
+agent --repo ~/code/myproject --shell
+```
+
+### Session management
+
+```bash
+agent ls                     # list all sessions, newest first
+agent rm <session-id>        # remove a session and its workspace
+agent clean                  # remove unnamed sessions older than 7 days
+agent clean --days 0         # remove all unnamed sessions
+```
+
+### Ollama backend
+
+```bash
+agent --repo ~/code/myproject --ollama http://192.168.1.50:11434
+# or set OLLAMA_BASE_URL and just pass --ollama
+```
+
+### Rebuild the image
+
+```bash
+agent-build            # normal build
+agent-build --no-cache # force full layer rebuild
+```
+
+## Session storage
+
+Sessions persist at `~/.agent-sandbox/sessions/<id>/` after the container exits.
+
+```
+~/.agent-sandbox/
+  docker/           ← Dockerfile + entrypoint (installed manually; see Installation)
+  sessions/
+    20240315-143022-myproject-auth-refactor/
+      session.json  ← session metadata
+      workspace/    ← cloned repo lives here
+```
+
+For mounted local repos (`--repo ~/path/to/repo`), the workspace is your original directory and is never deleted by `agent rm` or `agent clean`.
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_SANDBOX_DIR` | `~/.agent-sandbox/docker` | Where `agent-build` looks for the Dockerfile |
+| `OLLAMA_BASE_URL` | — | Default Ollama URL for `--ollama` |
+| `DOCKER_CONTEXT` | system default | Docker context (e.g. `desktop-linux` for Docker Desktop on Mac) |

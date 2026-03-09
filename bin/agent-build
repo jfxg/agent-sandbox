@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# agent-build: Build (or rebuild) the agent-sandbox Docker image.
+#
+# Usage:
+#   agent-build [--no-cache]
+#
+# Options:
+#   --no-cache   Pass --no-cache to docker build (forces full layer rebuild)
+#   -h, --help   Show this help message
+#
+# Environment:
+#   AGENT_SANDBOX_DIR   Path to the directory containing the Dockerfile.
+#                       Defaults to ~/.agent-sandbox/docker (where the docker/
+#                       files should be copied on installation).
+#   DOCKER_CONTEXT      Docker context to use (e.g. "desktop-linux"). Respected
+#                       natively by the docker CLI. Must match the context used
+#                       by the agent script, or the built image won't be found.
+set -euo pipefail
+
+DOCKERFILE_DIR="${AGENT_SANDBOX_DIR:-$HOME/.agent-sandbox/docker}"
+IMAGE_NAME="agent-sandbox"
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
+green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
+blue()  { printf '\033[0;34m%s\033[0m\n' "$*"; }
+red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+NO_CACHE=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-cache) NO_CACHE=true; shift ;;
+        -h|--help)
+            sed -n '2,/^set /p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) red "error: unknown argument: $1"; exit 1 ;;
+    esac
+done
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+if ! command -v docker &>/dev/null; then
+    red "error: docker is not installed or not in PATH"
+    exit 1
+fi
+
+if [[ ! -f "$DOCKERFILE_DIR/Dockerfile" ]]; then
+    red "error: Dockerfile not found at $DOCKERFILE_DIR"
+    red "  copy the docker/ files from agent-sandbox to ~/.agent-sandbox/docker/"
+    red "  or set AGENT_SANDBOX_DIR to override the location"
+    exit 1
+fi
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+BUILD_ARGS=(--tag "$IMAGE_NAME" "$DOCKERFILE_DIR")
+$NO_CACHE && BUILD_ARGS=(--no-cache "${BUILD_ARGS[@]}")
+
+blue "==> Building image '$IMAGE_NAME'..."
+$NO_CACHE && blue "    (--no-cache: skipping layer cache)"
+
+docker build "${BUILD_ARGS[@]}"
+
+green "==> Done."
