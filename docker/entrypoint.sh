@@ -33,7 +33,10 @@ fi
 # ~/.local/share/claude is used by the native installer for auth storage.
 if [[ -d /tmp/claude-local-share ]]; then
     mkdir -p "$HOME/.local/share/claude"
-    cp -rp /tmp/claude-local-share/. "$HOME/.local/share/claude/"
+    for item in /tmp/claude-local-share/*; do
+        [[ "$(basename "$item")" == "versions" ]] && continue
+        cp -rp "$item" "$HOME/.local/share/claude/"
+    done
 fi
 
 # ── Determine working directory ───────────────────────────────────────────────

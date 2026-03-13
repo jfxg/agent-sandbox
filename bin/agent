@@ -352,6 +352,8 @@ if [[ "$SKIP_AUTH" == false ]]; then
         DOCKER_ARGS+=(--volume "$HOME/.claude.json":/tmp/claude-host.json:ro)
     [[ -d "$HOME/.local/share/claude" ]] && \
         DOCKER_ARGS+=(--volume "$HOME/.local/share/claude":/tmp/claude-local-share:ro)
+    [[ -d "$HOME/.config/ccstatusline" ]] && \
+        DOCKER_ARGS+=(--volume "$HOME/.config/ccstatusline":/home/agent/.config/ccstatusline:ro)
 fi
 
 # ── Backend-specific config ───────────────────────────────────────────────────
