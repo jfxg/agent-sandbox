@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     curl \
     ca-certificates \
+    gnupg \
     python3 \
     python3-pip \
     ripgrep \
@@ -13,6 +14,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     less \
     build-essential \
     zsh \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Java 21 (Eclipse Temurin) ─────────────────────────────────────────────────
+RUN curl -fsSL https://packages.adoptium.net/artifactory/api/gpg/key/public \
+        | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+        > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update && apt-get install -y --no-install-recommends temurin-21-jdk \
     && rm -rf /var/lib/apt/lists/*
 
 # ── GitHub CLI ────────────────────────────────────────────────────────────────
