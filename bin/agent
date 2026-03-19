@@ -19,6 +19,8 @@
 #   --repo <slug>   Clone a GitHub repo (e.g. "owner/repo") into a fresh /workspace.
 #                   Or pass a local path to mount an existing directory instead.
 #   --branch <ref>  Branch, tag, or SHA to check out after cloning (used with --repo slug).
+#   --worktree [name]  Enable Claude Code's worktree mode for multi-agent work,
+#                   with an optional feature/worktree name (e.g. "my-new-feature")
 #   --shell         Drop into a zsh shell instead of launching Claude
 #   --no-auth       Skip copying host credentials into the container (useful for
 #                   testing a fresh login to see where Claude stores auth on Linux)
@@ -58,6 +60,8 @@ SESSION_NAME=""
 RESUME_ID=""
 DROP_TO_SHELL=false
 SKIP_AUTH=false
+CLAUDE_WORKTREE=false
+WORKTREE_NAME=""
 BACKEND="anthropic"
 OLLAMA_URL=""
 PROMPT_ARGS=()
@@ -183,6 +187,15 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && { red "error: --branch requires a value"; exit 1; }
             CLONE_BRANCH="$2"
             shift 2
+            ;;
+        --worktree)
+            CLAUDE_WORKTREE=true
+            if [[ -n "${2:-}" && "${2:-}" != --* ]]; then
+                WORKTREE_NAME="$2"
+                shift 2
+            else
+                shift
+            fi
             ;;
         --shell)
             DROP_TO_SHELL=true
@@ -319,6 +332,12 @@ elif [[ ${#PROMPT_ARGS[@]} -gt 0 ]]; then
     CONTAINER_CMD=(claude --dangerously-skip-permissions "${PROMPT_ARGS[@]}")
 else
     CONTAINER_CMD=(claude --dangerously-skip-permissions)
+fi
+
+# Worktree mode: pass --worktree to claude for multi-agent work
+if $CLAUDE_WORKTREE && ! $DROP_TO_SHELL; then
+    CONTAINER_CMD+=(--worktree)
+    [[ -n "$WORKTREE_NAME" ]] && CONTAINER_CMD+=("$WORKTREE_NAME")
 fi
 
 # Ollama: default to gpt-oss model unless the user already passed --model
