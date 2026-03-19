@@ -6,7 +6,8 @@ BRANCH="main"
 RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 
 BIN_DIR="${HOME}/bin"
-DOCKER_DIR="${HOME}/.agent-sandbox/docker"
+SANDBOX_DIR="${HOME}/.agent-sandbox"
+DOCKER_DIR="${SANDBOX_DIR}/docker"
 
 info()    { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 success() { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
@@ -21,7 +22,7 @@ done
 info "Installing agent-sandbox..."
 
 # Create directories
-mkdir -p "$BIN_DIR" "$DOCKER_DIR"
+mkdir -p "$BIN_DIR" "$SANDBOX_DIR" "$DOCKER_DIR"
 
 # Download bin scripts
 info "Downloading scripts to ${BIN_DIR}..."
@@ -30,6 +31,10 @@ for script in agent agent-build; do
     chmod +x "${BIN_DIR}/${script}"
     success "${script}"
 done
+
+# Download VERSION to ~/.agent-sandbox so the agent script can compare it
+curl -fsSL "${RAW}/VERSION" -o "${SANDBOX_DIR}/VERSION"
+success "VERSION"
 
 # Download docker files
 info "Downloading Docker files to ${DOCKER_DIR}..."

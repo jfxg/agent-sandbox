@@ -44,6 +44,9 @@ set -euo pipefail
 IMAGE_NAME="agent-sandbox"
 AGENT_SANDBOX_BASE="$HOME/.agent-sandbox"
 SESSIONS_BASE="$AGENT_SANDBOX_BASE/sessions"
+AGENT_REPO="jfxg/agent-sandbox"
+AGENT_VERSION_FILE="$AGENT_SANDBOX_BASE/VERSION"
+AGENT_VERSION_URL="https://raw.githubusercontent.com/$AGENT_REPO/main/VERSION"
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
@@ -256,6 +259,20 @@ if [[ -z "$(docker images -q "$IMAGE_NAME" 2>/dev/null)" ]]; then
     fi
     "$AGENT_BUILD"
 fi
+
+# ── Version check ─────────────────────────────────────────────────────────────
+# Curl the VERSION file from GitHub in the background and compare to local.
+# Skipped silently on network failure or if the local VERSION file is missing.
+_check_version() {
+    local local_version remote_version
+    [[ -f "$AGENT_VERSION_FILE" ]] || return 0
+    local_version="$(tr -d '[:space:]' < "$AGENT_VERSION_FILE")"
+    remote_version="$(curl -fsSL --max-time 3 "$AGENT_VERSION_URL" 2>/dev/null | tr -d '[:space:]')" || return 0
+    [[ -n "$remote_version" && "$local_version" != "$remote_version" ]] || return 0
+    yellow "==> Update available: agent-sandbox $remote_version (you have $local_version)"
+    dim "    Run: cd <agent-sandbox repo> && git pull && ./install.sh"
+}
+_check_version
 
 # ── Preflight: --branch only makes sense with a GitHub slug ───────────────────
 if [[ -n "$CLONE_BRANCH" && -z "$CLONE_REPO" ]]; then
