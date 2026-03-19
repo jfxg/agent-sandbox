@@ -70,3 +70,20 @@ The project is four files:
 - All logic lives in bash scripts — no linting or test infrastructure exists.
 - The `install.sh` script copies `bin/agent` and `bin/agent-build` to `~/bin/` and docker files to `~/.agent-sandbox/docker/`. After editing scripts locally, re-run `./install.sh` to apply changes, then `agent-build` if the Dockerfile changed.
 - `entrypoint.sh` runs as root inside the container before `su agent` — keep it minimal and side-effect-free on the host.
+
+## Versioning
+
+The version is stored in the `VERSION` file at the repo root (e.g. `0.1.0`). The `agent` script curls this file from GitHub on each run and warns the user if their local version is out of date.
+
+**When to bump the version:**
+- Any change to `bin/agent` or `bin/agent-build` (user-facing behaviour change, new flag, bug fix)
+- Any change to `docker/Dockerfile` or `docker/entrypoint.sh` that requires a rebuild
+- Changes to `install.sh`
+- No need to bump for README, CLAUDE.md, or comment-only changes
+
+**How to bump:**
+1. Edit `VERSION` with the new version string (use [semver](https://semver.org/): `MAJOR.MINOR.PATCH`)
+   - Patch: bug fixes, small tweaks
+   - Minor: new flags or features, backward-compatible
+   - Major: breaking changes to CLI interface or session format
+2. Commit it alongside the change that warranted the bump — not as a separate commit

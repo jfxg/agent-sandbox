@@ -21,6 +21,7 @@ cd agent-sandbox
 cp bin/agent bin/agent-build ~/bin/
 chmod +x ~/bin/agent ~/bin/agent-build
 cp -r docker/ ~/.agent-sandbox/docker/
+cp VERSION ~/.agent-sandbox/VERSION
 agent-build
 ```
 
@@ -99,6 +100,29 @@ Sessions persist at `~/.agent-sandbox/sessions/<id>/` after the container exits.
 ```
 
 For mounted local repos (`--repo ~/path/to/repo`), the workspace is your original directory and is never deleted by `agent rm` or `agent clean`.
+
+## Updates
+
+`agent` checks the current version against GitHub on every run and prints a warning if you're out of date:
+
+```
+==> Update available: agent-sandbox 0.2.0 (you have 0.1.0)
+    Run: cd <agent-sandbox repo> && git pull && ./install.sh
+```
+
+To update, re-run the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jfxg/agent-sandbox/main/install.sh | bash
+```
+
+Or if you cloned the repo:
+
+```bash
+git pull && ./install.sh
+```
+
+The check is non-blocking and fails silently if you're offline.
 
 ## Environment variables
 
