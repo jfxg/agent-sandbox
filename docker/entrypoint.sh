@@ -39,6 +39,15 @@ if [[ -d /tmp/claude-local-share ]]; then
     done
 fi
 
+# ── Restore session conversation history ─────────────────────────────────────
+# The agent script bind-mounts the session's claude-history dir at /tmp/claude-history.
+# Symlink it into ~/.claude/projects so Claude reads and writes history there,
+# persisting conversations across container restarts.
+if [[ -d /tmp/claude-history ]]; then
+    mkdir -p "$HOME/.claude"
+    ln -sf /tmp/claude-history "$HOME/.claude/projects"
+fi
+
 # ── Determine working directory ───────────────────────────────────────────────
 # When cloning a repo, work inside /workspace/<reponame> so Claude's project
 # name matches the repo rather than showing the generic "workspace".

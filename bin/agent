@@ -12,12 +12,14 @@
 #   agent ls
 #
 # Options:
-#   --name <label>  Optional short label for the session (e.g. "infra"). Combined with
-#                   the date and project to form the full session ID shown on startup.
+#   --name <label>  Short label for the session (e.g. "infra"). If a session with this
+#                   name already exists (for the given --repo, if any), it is resumed.
+#                   Otherwise a new session is created with this label.
 #   --resume <id>   Resume an existing session by its full session ID.
 #   --ollama [url]  Use Ollama backend. URL defaults to $OLLAMA_BASE_URL if omitted.
 #   --repo <slug>   Clone a GitHub repo (e.g. "owner/repo") into a fresh /workspace.
 #                   Or pass a local path to mount an existing directory instead.
+#                   If a prior session exists for this repo it is resumed automatically.
 #   --branch <ref>  Branch, tag, or SHA to check out after cloning (used with --repo slug).
 #   --worktree [name]  Enable Claude Code's worktree mode for multi-agent work,
 #                   with an optional feature/worktree name (e.g. "my-new-feature")
@@ -286,6 +288,35 @@ if [[ -n "$RESUME_ID" && ( -n "$SESSION_NAME" || -n "$CLONE_REPO" || -n "$MOUNT_
     exit 1
 fi
 
+# ── Auto-resume for --repo / --name ───────────────────────────────────────────
+# Find the most recent session matching the given criteria and resume it:
+#   --repo alone:        match by repo (workspace path or clone slug + branch)
+#   --name alone:        match by name label
+#   --repo + --name:     both must match
+# Each criterion is applied only when the corresponding flag was provided.
+if [[ -z "$RESUME_ID" && ( -n "$SESSION_NAME" || -n "$MOUNT_REPO" || -n "$CLONE_REPO" ) ]]; then
+    _auto_best=""
+    _auto_best_time=0
+    for _sf in "$SESSIONS_BASE"/*/session.json; do
+        [[ -f "$_sf" ]] || continue
+        if [[ -n "$SESSION_NAME" ]]; then
+            [[ "$(jq -r '.name // ""' "$_sf")" == "$SESSION_NAME" ]] || continue
+        fi
+        if [[ -n "$MOUNT_REPO" ]]; then
+            [[ "$(jq -r '.workspace // ""' "$_sf")" == "$MOUNT_REPO" ]] || continue
+        elif [[ -n "$CLONE_REPO" ]]; then
+            [[ "$(jq -r '.clone_repo // ""' "$_sf")" == "$CLONE_REPO" ]] || continue
+            [[ "$(jq -r '.clone_branch // ""' "$_sf")" == "${CLONE_BRANCH:-}" ]] || continue
+        fi
+        _t="$(date -r "$_sf" +%s 2>/dev/null || stat -c %Y "$_sf" 2>/dev/null || echo 0)"
+        if [[ "$_t" -gt "$_auto_best_time" ]]; then
+            _auto_best_time="$_t"
+            _auto_best="$(basename "$(dirname "$_sf")")"
+        fi
+    done
+    [[ -n "$_auto_best" ]] && RESUME_ID="$_auto_best"
+fi
+
 # ── Session management ────────────────────────────────────────────────────────
 mkdir -p "$SESSIONS_BASE"
 
@@ -299,6 +330,7 @@ if [[ -n "$RESUME_ID" ]]; then
         exit 1
     fi
     SESSION_ID="$RESUME_ID"
+    SESSION_DIR="$SESSIONS_BASE/$SESSION_ID"
     WORKSPACE_HOST="$(jq -r '.workspace' "$SESSION_FILE")"
     CLONE_REPO="$(jq -r '.clone_repo // ""' "$SESSION_FILE")"
     CLONE_BRANCH="$(jq -r '.clone_branch // ""' "$SESSION_FILE")"
@@ -338,30 +370,44 @@ else
         --argjson managed "$_managed" \
         --arg clone_repo "${CLONE_REPO:-}" \
         --arg clone_branch "${CLONE_BRANCH:-}" \
-        '{workspace: $workspace, managed: $managed, clone_repo: $clone_repo, clone_branch: $clone_branch}' \
+        --arg name "${SESSION_NAME:-}" \
+        '{workspace: $workspace, managed: $managed, clone_repo: $clone_repo, clone_branch: $clone_branch, name: $name}' \
         > "$SESSION_DIR/session.json"
 fi
+
+# ── Claude conversation history ───────────────────────────────────────────────
+# Persist Claude's project-level conversation history across sessions by mounting
+# a per-session directory at the path Claude uses inside the container.
+CLAUDE_HISTORY_DIR="$SESSION_DIR/claude-history"
+mkdir -p "$CLAUDE_HISTORY_DIR"
 
 # ── Container command ─────────────────────────────────────────────────────────
 if $DROP_TO_SHELL; then
     CONTAINER_CMD=(zsh)
-elif [[ ${#PROMPT_ARGS[@]} -gt 0 ]]; then
-    CONTAINER_CMD=(claude --dangerously-skip-permissions "${PROMPT_ARGS[@]}")
 else
     CONTAINER_CMD=(claude --dangerously-skip-permissions)
-fi
 
-# Worktree mode: pass --worktree to claude for multi-agent work
-if $CLAUDE_WORKTREE && ! $DROP_TO_SHELL; then
-    CONTAINER_CMD+=(--worktree)
-    [[ -n "$WORKTREE_NAME" ]] && CONTAINER_CMD+=("$WORKTREE_NAME")
-fi
-
-# Ollama: default to gpt-oss model unless the user already passed --model
-if [[ "$BACKEND" == "ollama" ]] && ! $DROP_TO_SHELL; then
-    if [[ ! " ${PROMPT_ARGS[*]:-} " =~ " --model " ]]; then
-        CONTAINER_CMD+=(--model gpt-oss)
+    # When resuming a session that has history, continue the last conversation
+    # so Claude has the prior context rather than starting fresh.
+    if [[ -n "$RESUME_ID" ]] && [[ -n "$(ls -A "$CLAUDE_HISTORY_DIR" 2>/dev/null)" ]]; then
+        CONTAINER_CMD+=(--continue)
     fi
+
+    # Worktree mode: pass --worktree to claude for multi-agent work
+    if $CLAUDE_WORKTREE; then
+        CONTAINER_CMD+=(--worktree)
+        [[ -n "$WORKTREE_NAME" ]] && CONTAINER_CMD+=("$WORKTREE_NAME")
+    fi
+
+    # Ollama: default to gpt-oss model unless the user already passed --model
+    if [[ "$BACKEND" == "ollama" ]]; then
+        if [[ ! " ${PROMPT_ARGS[*]:-} " =~ " --model " ]]; then
+            CONTAINER_CMD+=(--model gpt-oss)
+        fi
+    fi
+
+    # Prompt args go last
+    [[ ${#PROMPT_ARGS[@]} -gt 0 ]] && CONTAINER_CMD+=("${PROMPT_ARGS[@]}")
 fi
 
 # ── Docker flags ──────────────────────────────────────────────────────────────
@@ -391,6 +437,10 @@ if [[ "$SKIP_AUTH" == false ]]; then
     [[ -d "$HOME/.config/ccstatusline" ]] && \
         DOCKER_ARGS+=(--volume "$HOME/.config/ccstatusline":/home/agent/.config/ccstatusline:ro)
 fi
+
+# Mount the session's history directory at a neutral path; entrypoint.sh
+# symlinks it into ~/.claude/projects so Claude can find it.
+DOCKER_ARGS+=(--volume "$CLAUDE_HISTORY_DIR":/tmp/claude-history)
 
 # ── Backend-specific config ───────────────────────────────────────────────────
 if [[ "$BACKEND" == "ollama" ]]; then
